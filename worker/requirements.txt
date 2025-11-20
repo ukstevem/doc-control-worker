@@ -1,0 +1,4 @@
+supabase==2.24.0
+python-dotenv==1.0.1
+pdf2image==1.17.0
+Pillow==10.4.0

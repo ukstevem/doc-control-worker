@@ -1,0 +1,22 @@
+services:
+  pdf_worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: doc_pdf_worker
+    restart: unless-stopped
+
+    environment:
+      DOC_NAS_ROOT: /data/input
+      # These will be read by the worker once we wire up Supabase logic
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+
+    volumes:
+      - /mnt/doc_nas:/data/input:ro
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
