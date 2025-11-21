@@ -1,9 +1,0 @@
-services:
-  pdf_worker:
-    restart: "no"
-    volumes:
-      # Use a local folder with test PDFs instead of the NAS
-      - ./dev_input:/data/input:ro
-      - ./dev_state:/data/state
-      # Optional: live-mount code so edits don’t need rebuilds
-      - ./worker/app:/app/app

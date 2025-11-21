@@ -12,7 +12,11 @@ venv/
 
 # Docker
 *.log
+docker-compose.override.yml
 
 #Other
 *.jpg
 *.pdf
+.env
+
+
