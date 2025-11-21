@@ -23,6 +23,23 @@ def create_supabase_client() -> Client | None:
 
     return client
 
+def ping_document_files_table(client: Client) -> None:
+    """Print the number of rows in document_files (bounded)."""
+    try:
+        response = (
+            client.table("document_files")
+            .select("id", count="exact")
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[error] Supabase ping failed: {exc}", file=sys.stderr)
+        return
+
+    # supabase-py v2 returns a struct with .data and .count
+    count = getattr(response, "count", None)
+    print(f"[info] document_files table reachable; count={count}")
+
 
 def get_env(name: str, default: str | None = None) -> str:
     """Get an env var or exit with a clear error."""
@@ -104,6 +121,11 @@ def main() -> int:
     doc_root = Path(doc_root_str)
     preview_root = ensure_preview_dir(Path(preview_root_str))
 
+    # Supabase connectivity check (optional)
+    supabase = create_supabase_client()
+    if supabase is not None:
+        ping_document_files_table(supabase)
+        
     print(f"[info] Using DOC_NAS_ROOT={doc_root}")
     print(f"[info] Using PREVIEW_ROOT={preview_root}")
 
