@@ -12,3 +12,7 @@ venv/
 
 # Docker
 *.log
+
+#Other
+*.jpg
+*.pdf

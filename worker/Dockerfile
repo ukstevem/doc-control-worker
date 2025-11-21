@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Create state dir with correct ownership
+RUN mkdir -p /data/state && chown -R appuser:appuser /data
+
 USER appuser
 ENV PYTHONUNBUFFERED=1
 
