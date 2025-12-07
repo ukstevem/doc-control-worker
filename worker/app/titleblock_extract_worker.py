@@ -70,25 +70,30 @@ def get_nas_root() -> Path:
 
 def parse_fingerprint(raw_fp: Any) -> Optional[Dict[str, Any]]:
     """
-    Parse titleblock_fingerprint JSON and ensure it has a 'clicks' list.
+    Parse the JSON fingerprint into a Python dict.
+
+    We now expect a v2-style object with an "areas" array containing
+    boxed regions inside the title-block (all coords normalised 0–1
+    relative to the title-block crop).
     """
     if raw_fp is None:
         return None
 
     if isinstance(raw_fp, str):
         try:
-            raw_fp = json.loads(raw_fp)
+            fp = json.loads(raw_fp)
         except json.JSONDecodeError:
             return None
-
-    if not isinstance(raw_fp, dict):
+    elif isinstance(raw_fp, dict):
+        fp = raw_fp
+    else:
         return None
 
-    clicks = raw_fp.get("clicks")
-    if not isinstance(clicks, list) or not clicks:
+    areas = fp.get("areas")
+    if not isinstance(areas, list) or not areas:
         return None
 
-    return raw_fp
+    return fp
 
 
 def fetch_tagged_pages(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List[Dict[str, Any]]:
@@ -98,7 +103,7 @@ def fetch_tagged_pages(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List[D
       - status in ('tagged', 'Tagged')
       - image_object_path set
       - titleblock_x/y/width/height set (0–1 fractions)
-      - titleblock_fingerprint has clicks
+      - titleblock_fingerprint has areas
     """
     try:
         response = (
@@ -138,7 +143,9 @@ def fetch_tagged_pages(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List[D
 
         fp = parse_fingerprint(row.get("titleblock_fingerprint"))
         if fp is None:
-            print(f"[debug] page_id={page_id} skipped: no usable fingerprint.clicks")
+            print(
+                f"[info] skipping page_id={page_id} because it has no fingerprint.areas"
+            )
             continue
 
         row["_parsed_fingerprint"] = fp
@@ -244,7 +251,7 @@ def insert_titleblock_template(
     name: Optional[str] = None,
 ) -> Optional[Any]:
     """
-    Insert a new titleblock_templates row and return its id.
+    Insert a new document_titleblock_templates row and return its id.
     We keep this simple for now; matching/deduplication is a later concern.
     """
     payload: Dict[str, Any] = {
@@ -255,14 +262,14 @@ def insert_titleblock_template(
         payload["name"] = name
 
     try:
-        response = client.table("titleblock_templates").insert(payload).execute()
+        response = client.table("document_titleblock_templates").insert(payload).execute()
     except Exception as exc:
         print(f"[error] Failed to insert titleblock_template: {exc}", file=sys.stderr)
         return None
 
     rows = getattr(response, "data", None) or []
     if not rows:
-        print("[error] titleblock_templates insert returned no rows", file=sys.stderr)
+        print("[error] document_titleblock_templates insert returned no rows", file=sys.stderr)
         return None
 
     template_id = rows[0].get("id")
@@ -274,21 +281,21 @@ def insert_titleblock_template(
 # PDF helpers
 # ---------------------------------------------------------------------
 
-def ocr_text_from_region(
+def ocr_vertical_text_labels(
     img_gray: np.ndarray,
     x0: int,
     y0: int,
     x1: int,
     y1: int,
-    *,
-    psm: int = 7,
-    debug_output_path: Optional[Path] = None,
-) -> str:
+) -> List[str]:
     """
-    Run Tesseract OCR on a grayscale region.
-    Returns a single line of cleaned text (or empty string).
+    OCR for labels that are rotated 90° (e.g. 'DWG NUM').
 
-    If debug_output_path is not None, saves the binarised ROI as a PNG.
+    We:
+    - Crop ROI from img_gray
+    - Binarise
+    - Rotate 90° so vertical text becomes horizontal
+    - Run Tesseract and keep mostly-letter tokens as "labels"
     """
     h, w = img_gray.shape[:2]
     x0 = max(0, min(w, x0))
@@ -297,11 +304,11 @@ def ocr_text_from_region(
     y1 = max(0, min(h, y1))
 
     if x1 <= x0 or y1 <= y0:
-        return ""
+        return []
 
     roi = img_gray[y0:y1, x0:x1]
     if roi.size == 0:
-        return ""
+        return []
 
     try:
         _, roi_bin = cv2.threshold(
@@ -310,92 +317,546 @@ def ocr_text_from_region(
     except Exception:
         roi_bin = roi
 
-    # Optional debug crop
+    # Rotate 90° clockwise so vertical text becomes horizontal
+    try:
+        rot = cv2.rotate(roi_bin, cv2.ROTATE_90_CLOCKWISE)
+    except Exception:
+        rot = roi_bin
+
+    try:
+        rot = cv2.resize(
+            rot,
+            None,
+            fx=2.0,
+            fy=2.0,
+            interpolation=cv2.INTER_CUBIC,
+        )
+    except Exception:
+        pass
+
+    config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.:"
+    text = pytesseract.image_to_string(rot, config=config)
+    if not text:
+        return []
+
+    labels: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for tok in line.split():
+            tok = tok.strip().upper()
+            if not tok:
+                continue
+            digits = sum(ch.isdigit() for ch in tok)
+            letters = sum("A" <= ch <= "Z" for ch in tok)
+            # Treat mostly-letter tokens as labels (e.g. 'DWG', 'DWGNUM')
+            if letters >= 2:
+                labels.append(tok)
+
+    # Deduplicate
+    return sorted(set(labels))
+
+
+def clean_drawing_number(raw_text: str) -> str:
+    """
+    Clean drawing_number OCR result.
+
+    Handles:
+      - leading junk digits like '23C25001-1-1042' → 'C25001-1-1042'
+      - removal of obvious label words (DWG, NUM, DRAWING, TITLE, REV, ...)
+    """
+    if not raw_text:
+        return ""
+
+    t = raw_text.strip().upper()
+    if not t:
+        return ""
+
+    # --------------------------------------------------
+    # Step 1: character-level fix for leading junk digits
+    # --------------------------------------------------
+    # Find first alphabetic character (likely the 'C' in C25001-1-1042)
+    first_letter_idx = -1
+    for i, ch in enumerate(t):
+        if "A" <= ch <= "Z":
+            first_letter_idx = i
+            break
+
+    if first_letter_idx > 0:
+        prefix = t[:first_letter_idx]
+        suffix = t[first_letter_idx:]
+
+        # Prefix is considered "junk" if:
+        # - it is short (<= 2 chars)
+        # - and contains only digits (optionally punctuation like -_/.:)
+        if prefix and len(prefix) <= 2:
+            if all((c.isdigit() or c in "-_.:/") for c in prefix):
+                # Check that suffix looks like a real drawing number:
+                digits_suffix = sum(c.isdigit() for c in suffix)
+                letters_suffix = sum("A" <= c <= "Z" for c in suffix)
+                if digits_suffix >= 3 and letters_suffix >= 1:
+                    # Drop the numeric prefix (e.g. '23')
+                    t = suffix
+
+    # --------------------------------------------------
+    # Step 2: token-level label removal & sanity
+    # --------------------------------------------------
+    LABEL_WORDS = {
+        "DWG",
+        "NUM",
+        "NO",
+        "NO.",
+        "DRAWING",
+        "TITLE",
+        "REV",
+        "REVISION",
+    }
+
+    tokens = t.split()
+    if not tokens:
+        return t
+
+    cleaned_tokens: List[str] = []
+    has_good_pattern = False
+
+    for tok in tokens:
+        tok_u = tok.upper().strip(":")
+        if tok_u in LABEL_WORDS:
+            # strip labels like 'DWG', 'NUM', etc
+            continue
+
+        digits = sum(ch.isdigit() for ch in tok_u)
+        letters = sum("A" <= ch <= "Z" for ch in tok_u)
+
+        # "Good" drawing-number-like token:
+        if (digits >= 1 and letters >= 1 and len(tok_u) >= 3) or digits >= 3:
+            cleaned_tokens.append(tok_u)
+            has_good_pattern = True
+        else:
+            # ambiguous short tokens (e.g. '23') – we only keep them
+            # if we don't find any better tokens
+            cleaned_tokens.append(tok_u)
+
+    if has_good_pattern and cleaned_tokens:
+        return " ".join(cleaned_tokens).strip()
+
+    if cleaned_tokens:
+        return " ".join(cleaned_tokens).strip()
+
+    return t
+
+def ocr_text_from_region(
+    img_gray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    *,
+    psm: int = 7,
+    whitelist: Optional[str] = None,
+    multi_line: bool = False,   # kept for interface; we choose psm per field
+    debug_output_path: Optional[Path] = None,
+    field_name: Optional[str] = None,
+) -> str:
+    """
+    OCR a region of the page.
+
+    For drawing_number / revision we:
+      - drop tall-skinny (rotated) words,
+      - drop much smaller label text (smaller font),
+      - drop known label words like DWG / NUM / DRAWING / TITLE / REV.
+
+    For drawing_title we keep it simple:
+      - just use Tesseract's line-based output so we don't chop words
+        or scramble the order, and let normalise_ocr_for_field() do
+        the label cleanup.
+    """
+    if pytesseract is None:
+        return ""
+
+    h_img, w_img = img_gray.shape[:2]
+    x0 = max(0, min(w_img, x0))
+    x1 = max(0, min(w_img, x1))
+    y0 = max(0, min(h_img, y0))
+    y1 = max(0, min(h_img, y1))
+
+    if x1 <= x0 or y1 <= y0:
+        return ""
+
+    roi = img_gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return ""
+
+    # Upscale a bit to help OCR
+    try:
+        roi_big = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        roi_big = roi
+
+    # Light denoise + binarise
+    roi_blur = cv2.GaussianBlur(roi_big, (3, 3), 0)
+    _, roi_bin = cv2.threshold(
+        roi_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Optional debug image
     if debug_output_path is not None:
         try:
-            debug_output_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(debug_output_path), roi_bin)
         except Exception as exc:
             print(
-                f"[warn] Failed to write OCR debug crop to {debug_output_path}: {exc}",
+                f"[warn] ocr_text_from_region: failed to write debug image: {exc}",
                 file=sys.stderr,
             )
 
-    config = f"--psm {psm}"
-    text = pytesseract.image_to_string(roi_bin, config=config)
+    # Build Tesseract config
+    config = f"--psm {int(psm)} -c preserve_interword_spaces=1"
+    if whitelist:
+        config += f" -c tessedit_char_whitelist={whitelist}"
 
+    # ------------------------------------------------------------------
+    # SIMPLE PATH FOR DRAWING TITLE: don't overthink it, keep order.
+    # ------------------------------------------------------------------
+    if field_name == "drawing_title":
+        try:
+            txt = pytesseract.image_to_string(roi_bin, config=config)
+        except Exception as exc:
+            print(
+                f"[warn] ocr_text_from_region(drawing_title): image_to_string failed: {exc}",
+                file=sys.stderr,
+            )
+            return ""
+        return txt.strip()
+
+    # ------------------------------------------------------------------
+    # TOKEN-BASED PATH for drawing_number, revision, and others
+    # ------------------------------------------------------------------
+    try:
+        data = pytesseract.image_to_data(
+            roi_bin,
+            output_type=pytesseract.Output.DICT,
+            config=config,
+        )
+    except Exception as exc:
+        print(
+            f"[warn] ocr_text_from_region: image_to_data failed: {exc}",
+            file=sys.stderr,
+        )
+        try:
+            txt = pytesseract.image_to_string(roi_bin, config=config)
+        except Exception:
+            return ""
+        return txt.strip()
+
+    texts = data.get("text", [])
+    confs = data.get("conf", [])
+    lefts = data.get("left", [])
+    tops = data.get("top", [])
+    widths = data.get("width", [])
+    heights = data.get("height", [])
+
+    tokens: List[Dict[str, Any]] = []
+    for i in range(len(texts)):
+        raw = texts[i] or ""
+        text = raw.strip()
+        if not text:
+            continue
+
+        try:
+            conf = float(confs[i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if conf < 40.0:
+            # Very low-confidence noise
+            continue
+
+        try:
+            x = int(lefts[i])
+            y = int(tops[i])
+            w = int(widths[i])
+            h = int(heights[i])
+        except (TypeError, ValueError):
+            continue
+
+        tokens.append({"t": text, "x": x, "y": y, "w": w, "h": h})
+
+    if not tokens:
+        txt = pytesseract.image_to_string(roi_bin, config=config)
+        return txt.strip()
+
+    # --- Extra filtering for the key fields (NOT drawing_title now) ---
+    if field_name in ("drawing_number", "revision"):
+        # 1) Drop clearly vertical / tall-skinny words (rotated labels)
+        non_vertical: List[Dict[str, Any]] = []
+        for tok in tokens:
+            w = max(1, tok["w"])
+            h = tok["h"]
+            # heuristic: rotated glyphs are much taller than they are wide
+            if h > w * 1.5:
+                continue
+            non_vertical.append(tok)
+        if non_vertical:
+            tokens = non_vertical
+
+        if tokens:
+            # 2) Drop much smaller label text (based on height)
+            heights_list = [t["h"] for t in tokens]
+            max_h = max(heights_list)
+            size_cutoff = max_h * 0.7  # keep only the big stuff
+
+            big_tokens = [t for t in tokens if t["h"] >= size_cutoff]
+            if big_tokens:
+                tokens = big_tokens
+
+        if tokens:
+            # 3) Drop obvious label words
+            LABEL_WORDS = {
+                "DWG",
+                "NUM",
+                "NO",
+                "NO.",
+                "DRAWING",
+                "TITLE",
+                "REV",
+                "REVISION",
+            }
+            cleaned: List[Dict[str, Any]] = []
+            for tok in tokens:
+                norm = tok["t"].upper().strip(":")
+                if norm in LABEL_WORDS:
+                    continue
+                cleaned.append(tok)
+            if cleaned:
+                tokens = cleaned
+
+    # If nothing survived filtering, fall back to plain OCR
+    if not tokens:
+        txt = pytesseract.image_to_string(roi_bin, config=config)
+        return txt.strip()
+
+    # --- Rebuild text in reading order (top-to-bottom, left-to-right) ---
+    heights_list = [t["h"] for t in tokens]
+    max_h = max(heights_list)
+    line_gap = max_h * 0.6
+
+    tokens.sort(key=lambda t: (t["y"], t["x"]))
+
+    lines: List[str] = []
+    current_y: Optional[int] = None
+    current_words: List[str] = []
+
+    for tok in tokens:
+        if current_y is None:
+            current_y = tok["y"]
+            current_words = [tok["t"]]
+            continue
+
+        if abs(tok["y"] - current_y) <= line_gap:
+            # same line
+            current_words.append(tok["t"])
+        else:
+            # new line
+            lines.append(" ".join(current_words))
+            current_y = tok["y"]
+            current_words = [tok["t"]]
+
+    if current_words:
+        lines.append(" ".join(current_words))
+
+    result = "\n".join(lines).strip()
+    if not result:
+        result = pytesseract.image_to_string(roi_bin, config=config).strip()
+
+    return result
+
+def normalise_ocr_for_field(field_name: str, text: str) -> str:
+    """
+    Light, field-specific cleanup of OCR results.
+
+    Drawing-number-specific logic is handled separately by clean_drawing_number().
+    """
     if not text:
         return ""
 
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return line
-    return ""
+    t = text.strip()
 
+    if field_name == "revision":
+        # Typical issues: stray spaces, lowercase, '|' instead of '1'
+        t = t.replace(" ", "")
+        t = t.replace("|", "1")
+        t = t.upper()
+        if len(t) > 4:
+            t = t[:4]
+        return t
+
+    if field_name == "drawing_title":
+        # We want to strip label-like prefixes such as:
+        #   "DRAWING TITLE: ..."
+        #   "Drg. Title: ..."
+        #   "DRG TITLE ..."
+        # while keeping the actual title text.
+        lines = t.splitlines()
+        cleaned_segments: List[str] = []
+
+        LABEL_PREFIXES = [
+            "DRAWING TITLE",
+            "DRG. TITLE",
+            "DRG TITLE",
+            "DRG.",
+            "DRG",
+            "TITLE",
+        ]
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            up = stripped.upper()
+
+            # Does this line start with any known label prefix?
+            matched_prefix = None
+            for pref in LABEL_PREFIXES:
+                if up.startswith(pref):
+                    matched_prefix = pref
+                    break
+
+            if matched_prefix is not None:
+                # Try to keep only the part after ':' if present
+                if ":" in stripped:
+                    label_part, rest = stripped.split(":", 1)
+                    rest = rest.strip()
+                    if rest:
+                        cleaned_segments.append(rest)
+                    # If nothing after colon, treat as pure label and drop
+                else:
+                    # Line is just a label like "DRG TITLE" → drop it
+                    pass
+                continue
+
+            # Non-label line: keep as-is
+            cleaned_segments.append(stripped)
+
+        if cleaned_segments:
+            return " ".join(cleaned_segments).strip()
+
+        # If we somehow stripped everything, fall back to original text
+        return t
+
+    # Fallback: minimal cleanup for other fields
+    return t
 
 def compute_field_boxes_from_clicks(
     *,
+    img_width: int,
+    img_height: int,
     x0_tb: int,
     y0_tb: int,
     x1_tb: int,
     y1_tb: int,
     clicks: List[Dict[str, Any]],
-    band_height_rel: float = 0.14,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Build field_boxes in *titleblock-relative* coordinates (0–1).
+    Build *titleblock-relative* boxes from TB-relative clicks.
 
-    We assume:
-      - titleblock_x/y/width/height are 0–1 in page space
-      - click x_rel, y_rel are 0–1 *within the titleblock*
-    Strategy:
-      - group clicks by field
-      - for each field, we make a horizontal band across the whole TB width
-        centred on the average click y_rel, with configurable height.
+    - We assume click x_rel / y_rel are already 0–1 inside the titleblock.
+    - We create a small box around each click, expressed again 0–1 in TB space.
     """
-    if x1_tb <= x0_tb or y1_tb <= y0_tb:
-        return {}
 
-    # Group clicks by field
-    by_field: Dict[str, List[Dict[str, Any]]] = {}
-    for c in clicks:
-        field = c.get("field")
-        x_rel = c.get("x_rel")
-        y_rel = c.get("y_rel")
+    # How “wide” and “tall” each field box is, as a fraction of the TB size.
+    # You can tweak these if the crops are still too big/small.
+    BOX_HALF_WIDTH_TB  = 0.18   # 18% of TB width either side of the click
+    BOX_HALF_HEIGHT_TB = 0.08   # 8% of TB height above/below the click
+
+    field_boxes: Dict[str, Dict[str, float]] = {}
+
+    for click in clicks:
+        field_name = click.get("field")
+        x_rel = click.get("x_rel")
+        y_rel = click.get("y_rel")
+
         if (
-            not field
+            not field_name
             or not isinstance(x_rel, (float, int))
             or not isinstance(y_rel, (float, int))
         ):
             continue
-        by_field.setdefault(field, []).append(c)
 
-    field_boxes: Dict[str, Dict[str, float]] = {}
+        # Click is already TB-relative 0–1 → clamp for safety
+        cx = max(0.0, min(1.0, float(x_rel)))
+        cy = max(0.0, min(1.0, float(y_rel)))
 
-    half_band = band_height_rel / 2.0
+        # Tight box around the click, in TB-relative coords
+        x0_rel = max(0.0, cx - BOX_HALF_WIDTH_TB)
+        x1_rel = min(1.0, cx + BOX_HALF_WIDTH_TB)
+        y0_rel = max(0.0, cy - BOX_HALF_HEIGHT_TB)
+        y1_rel = min(1.0, cy + BOX_HALF_HEIGHT_TB)
 
-    for field, pts in by_field.items():
-        # Average Y of all clicks for that field
-        ys = [float(p["y_rel"]) for p in pts]
-        cy = sum(ys) / max(len(ys), 1)
-
-        # Clamp centre
-        cy = max(0.0, min(1.0, cy))
-
-        y0_rel = max(0.0, cy - half_band)
-        y1_rel = min(1.0, cy + half_band)
-
-        # Full width of TB: x0_rel=0, x1_rel=1
-        field_boxes[field] = {
-            "x0_rel": 0.0,
-            "x1_rel": 1.0,
+        field_boxes[field_name] = {
+            "x0_rel": x0_rel,
+            "x1_rel": x1_rel,
             "y0_rel": y0_rel,
             "y1_rel": y1_rel,
         }
 
     return field_boxes
 
+def compute_field_boxes_from_areas(
+    *,
+    areas: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, float]]:
+    """
+    Build titleblock-relative field boxes from client-supplied areas.
+
+    Each area is expected to have:
+      - field: field name (e.g. 'drawing_number')
+      - x_rel, y_rel: 0–1 top-left within the titleblock
+      - width_rel, height_rel: 0–1 size within the titleblock
+
+    Returns:
+      {
+        "drawing_number": {"x0_rel": ..., "y0_rel": ..., "x1_rel": ..., "y1_rel": ...},
+        ...
+      }
+    """
+    field_boxes: Dict[str, Dict[str, float]] = {}
+
+    for item in areas:
+        try:
+            field_name = str(item.get("field", "")).strip()
+            x_rel = float(item["x_rel"])
+            y_rel = float(item["y_rel"])
+            w_rel = float(item["width_rel"])
+            h_rel = float(item["height_rel"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if not field_name:
+            continue
+
+        # Clamp to [0, 1]
+        x_rel = max(0.0, min(1.0, x_rel))
+        y_rel = max(0.0, min(1.0, y_rel))
+        w_rel = max(0.0, min(1.0, w_rel))
+        h_rel = max(0.0, min(1.0, h_rel))
+
+        x0_rel = x_rel
+        y0_rel = y_rel
+        x1_rel = min(1.0, x_rel + w_rel)
+        y1_rel = min(1.0, y_rel + h_rel)
+
+        if x1_rel <= x0_rel or y1_rel <= y0_rel:
+            continue
+
+        field_boxes[field_name] = {
+            "x0_rel": x0_rel,
+            "y0_rel": y0_rel,
+            "x1_rel": x1_rel,
+            "y1_rel": y1_rel,
+        }
+
+    return field_boxes
 
 def map_img_bbox_to_pdf_rect(
     img_width: int,
@@ -587,6 +1048,24 @@ def compute_titleblock_fingerprint(
         "data": flat,
     }
 
+def mean_abs_diff(a, b):
+    if not a or not b:
+        return 1.0
+    n = min(len(a), len(b))
+    return sum(abs(a[i] - b[i]) for i in range(n)) / n
+
+def detect_grid_lines(img_gray):
+    edges = cv2.Canny(img_gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120,
+                            minLineLength=30, maxLineGap=10)
+    v, h = [], []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            if abs(x2 - x1) < 5:
+                v.append((x1 + x2) // 2)
+            elif abs(y2 - y1) < 5:
+                h.append((y1 + y2) // 2)
+    return sorted(v), sorted(h)
 
 def compute_field_boxes_relative_to_titleblock(
     tb_rect_pdf: fitz.Rect,
@@ -660,16 +1139,13 @@ def process_page(
         print(f"[error] page_id={page_id} missing titleblock bbox", file=sys.stderr)
         return
 
-    # Parsed fingerprint is expected to be a dict with "clicks"
+    # Parsed fingerprint is expected to be a dict with an "areas" list (v2 workflow)
     if not isinstance(fp, dict):
         fp = {}
-    clicks = fp.get("clicks") or []
-    if not isinstance(clicks, list):
-        clicks = []
-
-    if not clicks:
+    areas = fp.get("areas") or []
+    if not isinstance(areas, list) or not areas:
         print(
-            f"[info] page_id={page_id}: no clicks in fingerprint; "
+            f"[info] page_id={page_id}: no 'areas' in fingerprint; "
             f"skipping OCR + template creation"
         )
         return
@@ -708,7 +1184,7 @@ def process_page(
         update_page_error(client, page_id, "Titleblock ROI is empty after clamping")
         return
 
-    # ---------- OCR debug root (NEW) ----------
+    # ---------- OCR debug root ----------
     debug_root: Optional[Path] = None
     if DEBUG_OCR_CROPS:
         debug_root = image_path.parent / "debug_ocr"
@@ -722,18 +1198,12 @@ def process_page(
             )
             debug_root = None
 
-    # ---------- Build field_boxes from clicks ----------
-    field_boxes = compute_field_boxes_from_clicks(
-        x0_tb=x0_tb,
-        y0_tb=y0_tb,
-        x1_tb=x1_tb,
-        y1_tb=y1_tb,
-        clicks=clicks,
-    )
+    # ---------- Build field_boxes from areas ----------
+    field_boxes = compute_field_boxes_from_areas(areas=areas)
 
     if not field_boxes:
         print(
-            f"[info] page_id={page_id}: no field_boxes from clicks; "
+            f"[info] page_id={page_id}: no field_boxes from areas; "
             f"skipping OCR + template creation"
         )
         return
@@ -753,14 +1223,31 @@ def process_page(
         fx0 = int(round(x0_tb + x0_rel * tb_width))
         fx1 = int(round(x0_tb + x1_rel * tb_width))
         fy0 = int(round(y0_tb + y0_rel * tb_height))
-        fy1 = int(round(y1_tb + y1_rel * tb_height))
+        fy1 = int(round(y0_tb + y1_rel * tb_height))
 
+        # Small inward margin to avoid borders
+        margin = 2
+        fx0 = max(x0_tb, fx0 + margin)
+        fy0 = max(y0_tb, fy0 + margin)
+        fx1 = min(x1_tb, fx1 - margin)
+        fy1 = min(y1_tb, fy1 - margin)
+
+        # ---------- Per-field OCR config ----------
         if field_name == "revision":
-            psm = 10  # single char
+            psm = 10
+            whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            multi_line = False
+        elif field_name == "drawing_number":
+            psm = 7
+            whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/ ."
+            multi_line = False
         else:
-            psm = 7   # single line
+            # drawing_title or any other texty field
+            psm = 6  # block of text
+            whitelist = None
+            multi_line = True
 
-        # ---------- Build debug path per field (NEW) ----------
+        # ---------- Build debug path per field ----------
         debug_path = None
         if DEBUG_OCR_CROPS and debug_root is not None:
             safe_field = "".join(ch if ch.isalnum() else "_" for ch in str(field_name))
@@ -768,20 +1255,29 @@ def process_page(
                 f"page{page_number}_field-{safe_field}_pageid-{page_id}.png"
             )
 
-        text = ocr_text_from_region(
+        # Field-aware OCR with label/size filtering
+        raw_text = ocr_text_from_region(
             img_gray,
             fx0,
             fy0,
             fx1,
             fy1,
             psm=psm,
+            whitelist=whitelist,
+            multi_line=multi_line,
             debug_output_path=debug_path,
+            field_name=field_name,
         )
+
+        if field_name == "drawing_number":
+            text = clean_drawing_number(raw_text)
+        else:
+            text = normalise_ocr_for_field(field_name, raw_text)
 
         print(
             f"[info] page_id={page_id} field={field_name!r} "
             f"tb_box_rel=({x0_rel:.3f},{y0_rel:.3f},{x1_rel:.3f},{y1_rel:.3f}) "
-            f"pix=({fx0},{fy0},{fx1},{fy1}) OCR={text!r}"
+            f"pix=({fx0},{fy0},{fx1},{fy1}) OCR_raw={raw_text!r} OCR_clean={text!r}"
         )
 
         if text:
@@ -813,6 +1309,33 @@ def process_page(
         y1_tb,
     )
 
+    # New: page bbox (0–1 on full page) and normalised grid from *_grid.json
+    page_bbox_norm = {
+        "x": float(tb_x_rel),
+        "y": float(tb_y_rel),
+        "w": float(tb_w_rel),
+        "h": float(tb_h_rel),
+    }
+
+    grid_norm: Dict[str, Any] = {}
+    try:
+        grid_json_path = image_path.with_name(image_path.stem + "_grid.json")
+        if grid_json_path.exists():
+            with grid_json_path.open("r", encoding="utf-8") as f:
+                g = json.load(f)
+            w_crop = max(1, int(g["crop_size"]["width"]))
+            h_crop = max(1, int(g["crop_size"]["height"]))
+            v_px = g.get("vertical_lines", []) or []
+            h_px = g.get("horizontal_lines", []) or []
+            v_norm = [round(x / w_crop, 3) for x in v_px]
+            h_norm = [round(y / h_crop, 3) for y in h_px]
+            grid_norm = {
+                "verticals_norm": v_norm,
+                "horizontals_norm": h_norm,
+            }
+    except Exception as exc:
+        print(f"[warn] page_id={page_id}: could not attach grid to template: {exc}")
+
     required_fields = {"drawing_number", "drawing_title", "revision"}
     missing = required_fields.difference(field_boxes.keys())
     if missing:
@@ -823,7 +1346,9 @@ def process_page(
         return
 
     template_json: Dict[str, Any] = {
-        "version": 1,
+        "version": 2,
+        "page_bbox_norm": page_bbox_norm,
+        "grid": grid_norm,
         "fingerprint": fingerprint,
         "field_boxes": field_boxes,
     }
@@ -835,7 +1360,6 @@ def process_page(
     template_id = insert_titleblock_template(client, page_id, template_json, name=name)
     if template_id is not None:
         update_page_template_link(client, page_id, template_id, confidence=1.0)
-
 
 def run_once() -> int:
     client = create_supabase_client()
