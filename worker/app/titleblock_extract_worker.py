@@ -28,6 +28,11 @@ DOC_NAS_ROOT_ENV = "DOC_NAS_ROOT"
 
 FINGERPRINT_SIZE = 64  # edge thumbnail size for titleblock fingerprint
 
+# Page status values
+STATUS_TAGGED = "tagged"
+STATUS_EXTRACTED = "extracted"
+STATUS_EXTRACTION_FAILED = "extraction_failed"
+
 
 # ---------------------------------------------------------------------
 # Supabase + env helpers
@@ -113,12 +118,14 @@ def fetch_tagged_pages(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List[D
                 "image_object_path, "
                 "titleblock_x, titleblock_y, titleblock_width, titleblock_height, "
                 "titleblock_fingerprint, "
-                "drawing_number, drawing_title, revision"
+                "drawing_number, drawing_title, revision, "
+                "matched_titleblock_template_id"
             )
-            .in_("status", ["tagged", "Tagged"])
+            .in_("status", [STATUS_TAGGED, "Tagged"])
             .limit(limit)
             .execute()
         )
+
     except Exception as exc:
         print(f"[error] Failed to fetch tagged pages: {exc}", file=sys.stderr)
         return []
@@ -160,7 +167,7 @@ def fetch_document_info(client: Client, document_id: Any) -> Optional[Dict[str, 
     try:
         response = (
             client.table("document_files")
-            .select("id, storage_object_path")
+            .select("id, storage_object_path, doc_kind")
             .eq("id", document_id)
             .limit(1)
             .execute()
@@ -203,20 +210,110 @@ def update_page_fields(
             file=sys.stderr,
         )
 
+def update_document_fields(
+    client: Client,
+    document_id: Any,
+    fields: Dict[str, Optional[str]],
+) -> None:
+    """
+    Update document_files doc_number/doc_title/doc_revision from a field dict.
 
-def update_page_error(client: Client, page_id: Any, message: str) -> None:
+    We intentionally keep the mapping explicit so it's easy to reason about.
+    """
+    mapping = {
+        "drawing_number": "doc_number",
+        "drawing_title": "doc_title",
+        "revision": "doc_revision",
+    }
+
+    update_data: Dict[str, Any] = {}
+    for src_key, dst_key in mapping.items():
+        if src_key in fields:
+            update_data[dst_key] = fields[src_key]
+
+    if not update_data:
+        return
+
+    try:
+        (
+            client.table("document_files")
+            .update(update_data)
+            .eq("id", document_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(
+            f"[error] Failed to update document_files(id={document_id}) fields: {exc}",
+            file=sys.stderr,
+        )
+
+def update_document_fields(
+    client: Client,
+    document_id: Any,
+    fields: Dict[str, Optional[str]],
+) -> None:
+    """
+    Update document_files doc_number/doc_title/doc_revision from a field dict.
+
+    We intentionally keep the mapping explicit so it's easy to reason about.
+    """
+    mapping = {
+        "drawing_number": "doc_number",
+        "drawing_title": "doc_title",
+        "revision": "doc_revision",
+    }
+
+    update_data: Dict[str, Any] = {}
+    for src_key, dst_key in mapping.items():
+        if src_key in fields:
+            update_data[dst_key] = fields[src_key]
+
+    if not update_data:
+        return
+
+    try:
+        (
+            client.table("document_files")
+            .update(update_data)
+            .eq("id", document_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(
+            f"[error] Failed to update document_files(id={document_id}) fields: {exc}",
+            file=sys.stderr,
+        )
+
+def update_page_status(
+    client: Client,
+    page_id: Any,
+    status: str,
+    message: Optional[str] = None,
+) -> None:
+    """Update status (and optional processing_error) in a bounded way."""
+    update_data: Dict[str, Any] = {"status": status}
+    if message:
+        update_data["processing_error"] = message[:500]
+
     try:
         (
             client.table("document_pages")
-            .update({"processing_error": message[:500]})
+            .update(update_data)
             .eq("id", page_id)
             .execute()
         )
     except Exception as exc:
         print(
-            f"[error] Failed to update document_pages(id={page_id}) on error: {exc}",
+            f"[error] Failed to update status for document_pages(id={page_id}): {exc}",
             file=sys.stderr,
         )
+
+
+def update_page_error(client: Client, page_id: Any, message: str) -> None:
+    """
+    Mark a page as extraction_failed with a processing_error.
+    """
+    update_page_status(client, page_id, STATUS_EXTRACTION_FAILED, message)
 
 
 def update_page_template_link(
@@ -446,6 +543,7 @@ def clean_drawing_number(raw_text: str) -> str:
 
     return t
 
+
 def ocr_text_from_region(
     img_gray,
     x0: int,
@@ -670,6 +768,7 @@ def ocr_text_from_region(
 
     return result
 
+
 def normalise_ocr_for_field(field_name: str, text: str) -> str:
     """
     Light, field-specific cleanup of OCR results.
@@ -695,6 +794,9 @@ def normalise_ocr_for_field(field_name: str, text: str) -> str:
         #   "DRAWING TITLE: ..."
         #   "Drg. Title: ..."
         #   "DRG TITLE ..."
+        #   "DRG."
+        #   "DRG"
+        #   "TITLE"
         # while keeping the actual title text.
         lines = t.splitlines()
         cleaned_segments: List[str] = []
@@ -747,6 +849,7 @@ def normalise_ocr_for_field(field_name: str, text: str) -> str:
     # Fallback: minimal cleanup for other fields
     return t
 
+
 def compute_field_boxes_from_clicks(
     *,
     img_width: int,
@@ -766,8 +869,8 @@ def compute_field_boxes_from_clicks(
 
     # How “wide” and “tall” each field box is, as a fraction of the TB size.
     # You can tweak these if the crops are still too big/small.
-    BOX_HALF_WIDTH_TB  = 0.18   # 18% of TB width either side of the click
-    BOX_HALF_HEIGHT_TB = 0.08   # 8% of TB height above/below the click
+    BOX_HALF_WIDTH_TB = 0.18   # 18% of TB width either side of the click
+    BOX_HALF_HEIGHT_TB = 0.08  # 8% of TB height above/below the click
 
     field_boxes: Dict[str, Dict[str, float]] = {}
 
@@ -801,6 +904,7 @@ def compute_field_boxes_from_clicks(
         }
 
     return field_boxes
+
 
 def compute_field_boxes_from_areas(
     *,
@@ -857,6 +961,7 @@ def compute_field_boxes_from_areas(
         }
 
     return field_boxes
+
 
 def map_img_bbox_to_pdf_rect(
     img_width: int,
@@ -1048,11 +1153,13 @@ def compute_titleblock_fingerprint(
         "data": flat,
     }
 
+
 def mean_abs_diff(a, b):
     if not a or not b:
         return 1.0
     n = min(len(a), len(b))
     return sum(abs(a[i] - b[i]) for i in range(n)) / n
+
 
 def detect_grid_lines(img_gray):
     edges = cv2.Canny(img_gray, 50, 150, apertureSize=3)
@@ -1066,6 +1173,7 @@ def detect_grid_lines(img_gray):
             elif abs(y2 - y1) < 5:
                 h.append((y1 + y2) // 2)
     return sorted(v), sorted(h)
+
 
 def compute_field_boxes_relative_to_titleblock(
     tb_rect_pdf: fitz.Rect,
@@ -1117,6 +1225,7 @@ def process_page(
     page_number = page_row.get("page_number")
     image_rel = page_row.get("image_object_path")
     fp = page_row.get("_parsed_fingerprint")
+    matched_template_id = page_row.get("matched_titleblock_template_id")
 
     if page_id is None or document_id is None or page_number is None:
         print(
@@ -1126,7 +1235,9 @@ def process_page(
         return
 
     if not image_rel:
-        print(f"[error] page_id={page_id} missing image_object_path", file=sys.stderr)
+        msg = "page missing image_object_path"
+        print(f"[error] page_id={page_id} {msg}", file=sys.stderr)
+        update_page_error(client, page_id, msg)
         return
 
     # Normalised titleblock coordinates from client (0–1, full page)
@@ -1136,7 +1247,9 @@ def process_page(
     tb_h_rel = page_row.get("titleblock_height")
 
     if None in (tb_x_rel, tb_y_rel, tb_w_rel, tb_h_rel):
-        print(f"[error] page_id={page_id} missing titleblock bbox", file=sys.stderr)
+        msg = "missing titleblock bbox"
+        print(f"[error] page_id={page_id} {msg}", file=sys.stderr)
+        update_page_error(client, page_id, msg)
         return
 
     # Parsed fingerprint is expected to be a dict with an "areas" list (v2 workflow)
@@ -1144,10 +1257,9 @@ def process_page(
         fp = {}
     areas = fp.get("areas") or []
     if not isinstance(areas, list) or not areas:
-        print(
-            f"[info] page_id={page_id}: no 'areas' in fingerprint; "
-            f"skipping OCR + template creation"
-        )
+        msg = "no fingerprint.areas; cannot extract titleblock"
+        print(f"[info] page_id={page_id}: {msg}")
+        update_page_error(client, page_id, msg)
         return
 
     # Look up parent document_files row (still needed for consistency)
@@ -1155,6 +1267,10 @@ def process_page(
     if doc_info is None:
         update_page_error(client, page_id, "Missing parent document_files row")
         return
+
+    doc_kind = doc_info.get("doc_kind")
+    is_reference_doc = (doc_kind == "reference")
+
 
     storage_path = doc_info.get("storage_object_path")
     if not storage_path:
@@ -1202,16 +1318,19 @@ def process_page(
     field_boxes = compute_field_boxes_from_areas(areas=areas)
 
     if not field_boxes:
-        print(
-            f"[info] page_id={page_id}: no field_boxes from areas; "
-            f"skipping OCR + template creation"
-        )
+        msg = "no field_boxes from areas; cannot extract titleblock"
+        print(f"[info] page_id={page_id}: {msg}")
+        update_page_error(client, page_id, msg)
         return
 
     field_texts: Dict[str, str] = {}
 
     tb_width = x1_tb - x0_tb
     tb_height = y1_tb - y0_tb
+
+    # Track overall extraction success/failure
+    extraction_ok = False
+    extraction_message: Optional[str] = None
 
     for field_name, box in field_boxes.items():
         x0_rel = float(box["x0_rel"])
@@ -1292,12 +1411,26 @@ def process_page(
     if "revision" in field_texts:
         updates["revision"] = field_texts["revision"]
 
+    has_dn = bool(updates.get("drawing_number"))
+    has_title = bool(updates.get("drawing_title"))
+    has_rev = bool(updates.get("revision"))
+
     if updates:
         update_page_fields(client, page_id, updates)
+        # For reference documents, also push these fields up to document_files
+        if updates and is_reference_doc:
+            update_document_fields(client, document_id, updates)
+
+
+    if has_dn and has_title:
+        extraction_ok = True
+        if not has_rev:
+            extraction_message = "Revision not found in OCR"
     else:
-        print(
-            f"[info] page_id={page_id}: OCR found no text for any field"
-        )
+        if not updates:
+            extraction_message = "OCR found no text for any field"
+        else:
+            extraction_message = "OCR did not produce both drawing_number and drawing_title"
 
     # ----- Template JSON (fingerprint + geometry) -----
 
@@ -1336,30 +1469,64 @@ def process_page(
     except Exception as exc:
         print(f"[warn] page_id={page_id}: could not attach grid to template: {exc}")
 
-    required_fields = {"drawing_number", "drawing_title", "revision"}
-    missing = required_fields.difference(field_boxes.keys())
-    if missing:
+    # ----- Template JSON (fingerprint + geometry) -----
+    # Only create a new template if this page is NOT already linked
+    # to one (i.e. manual tag / first-time seed).
+    if matched_template_id is not None:
         print(
-            f"[warn] page_id={page_id}: missing field_boxes for {sorted(missing)}; "
-            f"skipping titleblock_template creation"
+            f"[info] page_id={page_id}: already linked to template "
+            f"{matched_template_id}; skipping template creation"
         )
-        return
+    else:
+        required_fields = {"drawing_number", "drawing_title", "revision"}
+        missing = required_fields.difference(field_boxes.keys())
+        if missing:
+            print(
+                f"[warn] page_id={page_id}: missing field_boxes for {sorted(missing)}; "
+                f"skipping titleblock_template creation"
+            )
+        else:
+            template_json: Dict[str, Any] = {
+                "version": 2,
+                "page_bbox_norm": page_bbox_norm,
+                "grid": grid_norm,
+                "fingerprint": fingerprint,
+                "field_boxes": field_boxes,
+            }
 
-    template_json: Dict[str, Any] = {
-        "version": 2,
-        "page_bbox_norm": page_bbox_norm,
-        "grid": grid_norm,
-        "fingerprint": fingerprint,
-        "field_boxes": field_boxes,
-    }
+            name = None
+            if "drawing_number" in field_texts:
+                name = f"titleblock_{field_texts['drawing_number']}"
 
-    name = None
-    if "drawing_number" in field_texts:
-        name = f"titleblock_{field_texts['drawing_number']}"
+            template_id = insert_titleblock_template(
+                client,
+                page_id,
+                template_json,
+                name=name,
+            )
+            if template_id is not None:
+                update_page_template_link(
+                    client,
+                    page_id,
+                    template_id,
+                    confidence=1.0,
+                )
 
-    template_id = insert_titleblock_template(client, page_id, template_json, name=name)
-    if template_id is not None:
-        update_page_template_link(client, page_id, template_id, confidence=1.0)
+    # ----- Final status update -----
+    if extraction_ok:
+        update_page_status(client, page_id, STATUS_EXTRACTED, extraction_message)
+        print(
+            f"[info] page_id={page_id}: extraction succeeded; "
+            f"status set to {STATUS_EXTRACTED!r}"
+        )
+    else:
+        msg = extraction_message or "OCR failed for titleblock fields"
+        update_page_status(client, page_id, STATUS_EXTRACTION_FAILED, msg)
+        print(
+            f"[info] page_id={page_id}: extraction failed; "
+            f"status set to {STATUS_EXTRACTION_FAILED!r} ({msg})"
+        )
+
 
 def run_once() -> int:
     client = create_supabase_client()

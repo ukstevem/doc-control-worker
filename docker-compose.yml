@@ -6,6 +6,8 @@ services:
     container_name: doc_pdf_worker
     restart: unless-stopped
 
+    command: ["python", "-m", "app.main"]
+
     environment:
       DEBUG_OCR_CROPS: "1"
       DOC_NAS_ROOT: /data/input
@@ -15,6 +17,10 @@ services:
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
       SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+
+      WORKER_MODE: ${WORKER_MODE:-once}         # default to one-shot
+      WORKER_LOOP_SLEEP: ${WORKER_LOOP_SLEEP:-10}
+      WORKER_MAX_CYCLES: ${WORKER_MAX_CYCLES:-0}  # 0 = run forever
 
     volumes:
       - /mnt/doc_nas:/data/input

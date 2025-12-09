@@ -21,18 +21,23 @@ DOC_NAS_ROOT_ENV = "DOC_NAS_ROOT"
 FINGERPRINT_SIZE = 64
 
 MIN_SIMILARITY_THRESHOLD = 0.97
-TRUST_FP_OVERRIDE = 0.95  
+TRUST_FP_OVERRIDE = 0.95
 
 GRID_WEIGHT = 0.5
 FP_WEIGHT = 0.5
 MAX_TOTAL_SCORE = 0.30
 GRID_ACCEPT_THRESHOLD = 0.9  # lower = stricter
 
+# Page status values (finite set, no free-text sentences)
+STATUS_RENDERED = "rendered"
+STATUS_TAGGED = "tagged"
+STATUS_MATCH_FAILED = "match_failed"
 
 
 # ---------------------------------------------------------------------
 # Supabase + env helpers
 # ---------------------------------------------------------------------
+
 
 def create_supabase_client() -> Optional[Client]:
     url = os.getenv("SUPABASE_URL")
@@ -68,6 +73,7 @@ def get_nas_root() -> Path:
 # ---------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------
+
 
 def fetch_templates(client: Client) -> List[Dict[str, Any]]:
     """
@@ -117,12 +123,14 @@ def fetch_templates(client: Client) -> List[Dict[str, Any]]:
     print(f"[info] {len(valid)} template(s) have usable fingerprint + field_boxes")
     return valid
 
+
 def fetch_pages_to_match(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List[Dict[str, Any]]:
     """
     Fetch candidate document_pages rows that:
 
       - have an image_object_path (PNG/JPEG already rendered),
-      - do NOT already have matched_titleblock_template_id.
+      - do NOT already have matched_titleblock_template_id,
+      - are in status='rendered'.
 
     We *do not* require per-page titleblock_x/y/width/height here;
     the template's page_bbox_norm is used as the default ROI.
@@ -133,11 +141,13 @@ def fetch_pages_to_match(client: Client, limit: int = MAX_PAGES_PER_RUN) -> List
             .select(
                 "id, document_id, page_number, image_object_path, "
                 "titleblock_x, titleblock_y, titleblock_width, titleblock_height, "
-                "matched_titleblock_template_id"
+                "matched_titleblock_template_id, status"
             )
+            .in_("status", [STATUS_RENDERED, STATUS_MATCH_FAILED])
             .limit(limit * 3)
             .execute()
         )
+
     except Exception as exc:
         print(f"[error] Failed to fetch document_pages for matching: {exc}", file=sys.stderr)
         return []
@@ -231,9 +241,35 @@ def update_page_template_link(
         )
 
 
+def update_page_status(
+    client: Client,
+    page_id: Any,
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    """Small helper to keep status updates consistent and bounded."""
+    update_data: Dict[str, Any] = {"status": status}
+    if error_message:
+        update_data["processing_error"] = error_message[:500]
+
+    try:
+        (
+            client.table("document_pages")
+            .update(update_data)
+            .eq("id", page_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(
+            f"[warn] page_id={page_id}: failed to update status={status!r}: {exc}",
+            file=sys.stderr,
+        )
+
+
 # ---------------------------------------------------------------------
 # Geometry + fingerprint helpers
 # ---------------------------------------------------------------------
+
 
 def compute_titleblock_fingerprint(
     img_gray: np.ndarray,
@@ -258,6 +294,7 @@ def compute_titleblock_fingerprint(
     small = cv2.resize(edges, (size, size), interpolation=cv2.INTER_AREA)
     flat = small.astype("uint8").flatten().tolist()
     return flat
+
 
 def detect_grid_lines(img_gray: np.ndarray) -> Tuple[List[int], List[int]]:
     """
@@ -304,7 +341,6 @@ def mean_abs_diff(a: List[float], b: List[float]) -> float:
     for i in range(n):
         total += abs(a[i] - b[i])
     return total / float(n)
-
 
 
 def compute_similarity(vec1: List[int], vec2: List[int]) -> float:
@@ -354,6 +390,7 @@ def map_img_bbox_to_pdf_rect(
 # ---------------------------------------------------------------------
 # Apply template to a page: extract text using field_boxes
 # ---------------------------------------------------------------------
+
 
 def extract_fields_using_template(
     pdf_path: Path,
@@ -436,6 +473,7 @@ def extract_fields_using_template(
 # ---------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------
+
 
 def process_page(
     client: Client,
@@ -604,15 +642,12 @@ def process_page(
     # ------------------------------------------------------------------
     if best_template_id is None or best_field_boxes is None or best_bbox_px is None:
         print(f"[info] page_id={page_id}: no usable template candidates")
-        try:
-            client.table("document_pages").update(
-                {"status": "no live match, please add zones of interest"}
-            ).eq("id", page_id).execute()
-        except Exception as exc:
-            print(
-                f"[warn] page_id={page_id}: failed to update status after no-match: {exc}",
-                file=sys.stderr,
-            )
+        update_page_status(
+            client,
+            page_id,
+            STATUS_MATCH_FAILED,
+            "no template candidates matched this page; please add zones of interest",
+        )
         return
 
     print(
@@ -647,19 +682,15 @@ def process_page(
         print(
             f"[info] page_id={page_id}: match not trusted "
             f"(score={best_score:.3f}, fp_sim={best_fp_sim:.3f}); "
-            f"marking as 'no live match, please add zones of interest'"
+            f"marking as match_failed"
         )
-        try:
-            client.table("document_pages").update(
-                {"status": "no live match, please add zones of interest"}
-            ).eq("id", page_id).execute()
-        except Exception as exc:
-            print(
-                f"[warn] page_id={page_id}: failed to update status after low-score: {exc}",
-                file=sys.stderr,
-            )
+        update_page_status(
+            client,
+            page_id,
+            STATUS_MATCH_FAILED,
+            "template match not trusted; please add zones of interest",
+        )
         return
-
 
     x0_tb, y0_tb, x1_tb, y1_tb = best_bbox_px
 
@@ -717,7 +748,7 @@ def process_page(
                 "titleblock_width": round(tb_w_rel, 6),
                 "titleblock_height": round(tb_h_rel, 6),
                 "titleblock_fingerprint": fingerprint_payload,
-                "status": "tagged",
+                "status": STATUS_TAGGED,
             }
         ).eq("id", page_id).execute()
         print(
