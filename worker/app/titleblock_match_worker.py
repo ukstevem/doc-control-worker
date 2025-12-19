@@ -14,7 +14,7 @@ from supabase import Client, create_client
 # Configuration
 # ---------------------------------------------------------------------
 
-MAX_PAGES_PER_RUN = 10
+MAX_PAGES_PER_RUN = 50
 MAX_TEMPLATES = 100
 
 DOC_NAS_ROOT_ENV = "DOC_NAS_ROOT"

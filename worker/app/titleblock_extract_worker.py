@@ -15,6 +15,7 @@ try:
 except ImportError:
     pytesseract = None  # type: ignore[assignment]
 
+from app.revision_indexer import index_revision_for_page
 
 DEBUG_OCR_CROPS = os.environ.get("DEBUG_OCR_CROPS", "").lower() in ("1", "true", "yes")
 
@@ -1417,20 +1418,15 @@ def process_page(
 
     if updates:
         update_page_fields(client, page_id, updates)
-        # For reference documents, also push these fields up to document_files
-        if updates and is_reference_doc:
-            update_document_fields(client, document_id, updates)
 
-
-    if has_dn and has_title:
-        extraction_ok = True
-        if not has_rev:
-            extraction_message = "Revision not found in OCR"
+        # After fields are written, index this page as a document version.
+        # This only touches document_state + revision links; it does not
+        # affect the main status used by the workers.
+        index_revision_for_page(client, page_id)
     else:
-        if not updates:
-            extraction_message = "OCR found no text for any field"
-        else:
-            extraction_message = "OCR did not produce both drawing_number and drawing_title"
+        print(
+            f"[info] page_id={page_id}: OCR found no text for any field"
+        )
 
     # ----- Template JSON (fingerprint + geometry) -----
 
